@@ -1,0 +1,12 @@
+# raw sensor recordings (large, personal); share via releases if needed
+data/
+
+# python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Claude Code plugin state
+.remember/
