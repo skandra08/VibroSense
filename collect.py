@@ -1,8 +1,14 @@
 """Record MacBook IMU data to disk.
 
-  python3 collect.py --list                     # check the sensor exists (no root)
-  sudo python3 collect.py rest --seconds 600    # noise-floor recording
-  sudo python3 collect.py protocol              # guided, labeled events
+  python3 collect.py --list                # check the sensor exists
+  python3 collect.py --probe                # what every SPU sensor delivers
+  python3 collect.py rest --seconds 600     # noise-floor recording
+  python3 collect.py protocol               # guided, labeled events
+
+No root needed on macOS 26 as the active console user: macOS keeps the IMU
+streaming for its own use, so we can open it and receive reports. The driver
+properties we set to wake it probably fail silently without root, which does
+not matter while the sensor is already on. If no data arrives, try sudo.
 
 Each run makes data/<timestamp>-<mode>/ containing:
   imu.csv     sensor,t,x,y,z   (accel in g, gyro in deg/s, t in seconds)
@@ -69,6 +75,8 @@ def main():
                                  formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("mode", nargs="?", choices=["rest", "protocol"])
     ap.add_argument("--list", action="store_true", help="list SPU devices and exit")
+    ap.add_argument("--probe", action="store_true",
+                    help="open every SPU sensor, report what it delivers, exit")
     ap.add_argument("--seconds", type=int, default=600, help="rest mode duration")
     ap.add_argument("--interval-us", type=int, default=1000,
                     help="requested driver report interval (default 1000 = 1 kHz)")
@@ -87,11 +95,18 @@ def main():
             print(f"  usage page 0x{page:04X}  usage {usage:<4} {tag}")
         print("IMU present:", sensor.has_imu())
         return 0
+
+    if args.probe:
+        print(f"{'page':>7} {'usage':>6}  {'opened':<7}{'reports/s':>10}  "
+              f"{'report bytes':<14}what we think it is")
+        for d in sensor.probe():
+            print(f" 0x{d['page']:04X} {d['usage']:>6}  "
+                  f"{'yes' if d['opened'] else 'NO':<7}{d['hz']:10.1f}  "
+                  f"{str(d['lengths']):<14}{d['name']}")
+        return 0
+
     if not args.mode:
-        ap.error("choose a mode: rest or protocol (or --list)")
-    if os.geteuid() != 0:
-        print("This needs root to wake and open the sensor. Re-run with sudo.")
-        return 1
+        ap.error("choose a mode: rest or protocol (or --list / --probe)")
 
     session = Path(args.out) / f"{time.strftime('%Y%m%d-%H%M%S')}-{args.mode}"
     session.mkdir(parents=True)

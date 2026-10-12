@@ -24,6 +24,16 @@ USAGE_ACCEL = 3
 USAGE_GYRO = 9
 SENSOR_NAMES = {USAGE_ACCEL: "accel", USAGE_GYRO: "gyro"}
 
+# Every SPU device we have identified, for probe(). Names in quotes are our
+# guesses from the driver's own `model` property; unlabelled ones are unknown.
+SPU_DEVICES = {
+    (0xFF00, 3): "accelerometer (Bosch BMI286)",
+    (0xFF00, 9): "gyroscope (Bosch BMI286)",
+    (0xFF00, 4): "ambient light (Redbird VD6286)",
+    (0xFF00, 5): "temperature? (TI TMP114)",
+    (0x0020, 138): "lid angle (MagAlpha ma781)",
+}
+
 REPORT_LEN = 22      # bytes per IMU report
 XYZ_OFFSET = 6       # where the three int32 values start
 Q16 = 65536.0        # fixed-point scale for both sensors
@@ -131,6 +141,54 @@ def has_imu():
             and (PAGE_VENDOR, USAGE_GYRO) in devs)
 
 
+def probe(seconds=4.0):
+    """Open every SPU sensor and report what it delivers.
+
+    Returns a list of dicts: usage page, usage, our name for it, whether it
+    opened, reports per second, and the report lengths seen. Useful for finding
+    out which sensors exist on a given Mac, since Apple documents none of them.
+    """
+    reader = ImuReader(lambda *a: None)
+    iokit, cf = reader._iokit, reader._cf
+    seen = {}
+
+    def tally(key):
+        def cb(_ctx, _result, _sender, _rtype, _rid, report, length, _ts):
+            d = seen[key]
+            d["reports"] += 1
+            d["lengths"].add(length)
+            d["last"] = bytes(report[: min(length, 24)]).hex()
+        return cb
+
+    for svc in _services(iokit, b"AppleSPUHIDDevice"):
+        page = _int_prop(iokit, cf, svc, "PrimaryUsagePage") or 0
+        usage = _int_prop(iokit, cf, svc, "PrimaryUsage") or 0
+        key = (page, usage)
+        seen[key] = {"page": page, "usage": usage, "reports": 0,
+                     "lengths": set(), "last": None,
+                     "name": SPU_DEVICES.get(key, "unknown"), "opened": False}
+        hid = iokit.IOHIDDeviceCreate(reader._alloc, svc)
+        if hid and iokit.IOHIDDeviceOpen(hid, 0) == 0:
+            seen[key]["opened"] = True
+            buf = (ctypes.c_uint8 * REPORT_BUF)()
+            cb = reader._callback_proto()(tally(key))
+            reader._keepalive += [buf, cb]
+            iokit.IOHIDDeviceRegisterInputReportWithTimeStampCallback(
+                hid, buf, REPORT_BUF, cb, None)
+            iokit.IOHIDDeviceScheduleWithRunLoop(
+                hid, cf.CFRunLoopGetCurrent(), reader._mode)
+        iokit.IOObjectRelease(svc)
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < seconds:
+        reader.pump(0.25)
+    elapsed = max(time.monotonic() - t0, 1e-9)
+    for d in seen.values():
+        d["hz"] = d["reports"] / elapsed
+        d["lengths"] = sorted(d["lengths"])
+    return sorted(seen.values(), key=lambda d: (d["page"], d["usage"]))
+
+
 class ImuReader:
     """Stream accelerometer and gyroscope samples to a callback.
 
@@ -158,14 +216,19 @@ class ImuReader:
         self._mode = ctypes.c_void_p.in_dll(self._cf, "kCFRunLoopDefaultMode")
         self._alloc = ctypes.c_void_p.in_dll(self._cf, "kCFAllocatorDefault")
 
-    def _make_callback(self, sensor):
-        # IOHIDReportWithTimeStampCallback(context, result, sender, type,
-        #                                  reportID, report, length, timestamp)
-        proto = ctypes.CFUNCTYPE(
+    @staticmethod
+    def _callback_proto():
+        """The C signature macOS calls us back with.
+
+        IOHIDReportWithTimeStampCallback(context, result, sender, type,
+                                        reportID, report, length, timestamp)
+        """
+        return ctypes.CFUNCTYPE(
             None, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_uint8), ctypes.c_long, ctypes.c_uint64)
 
+    def _make_callback(self, sensor):
         def on_report(_ctx, _result, _sender, _rtype, _rid, report, length, ts):
             if length != REPORT_LEN:
                 return
@@ -176,7 +239,7 @@ class ImuReader:
             x, y, z = struct.unpack_from("<3i", raw, XYZ_OFFSET)
             self.on_sample(sensor, ts * self._to_sec, x / Q16, y / Q16, z / Q16)
 
-        return proto(on_report)
+        return self._callback_proto()(on_report)
 
     def _wake_drivers(self):
         for svc in _services(self._iokit, b"AppleSPUHIDDriver"):
